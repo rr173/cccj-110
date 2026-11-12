@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# 运行产物与合成数据（演示可重新生成）
+out/
+sample_data/
+*.tmp

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flood-exposure"
+version = "1.0.0"
+description = "可追溯的流域洪水暴露度分析：等面积面积权重、窗口化栅格重采样、暂存发布"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "rasterio>=1.3",
+    "shapely>=2.0",
+    "pyproj>=3.6",
+    "geopandas>=0.14",
+    "pyogrio>=0.7",
+    "pandas>=2.0",
+]
+
+[project.scripts]
+flood-exposure = "flood_exposure.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["flood_exposure*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
