@@ -546,3 +546,146 @@ python3 -I tests/test_evacuation.py
   分钟与最少等待；
 * 打乱道路/路口/避险点/积水片段的排列次序重算，结果逐字节一致；
 * 混批执行确认无效请求不丢失其他请求的结论。
+
+# 水位-流量率定换算：`stage-discharge`
+
+纯本地、纯标准库的换算链（`flood_exposure/stage_discharge.py`），不接入
+网络，也不 import 或修改洪水栅格 / DEM / 雨量 / 撤离计算链。输入为观测
+CSV（`station_id,observed_at,stage_m`）与率定登记 JSON。
+
+## 21. 输入模型与整批拒绝
+
+* **观测时刻**必须带显式时区偏移，统一换算 UTC 后按 `(station_id,
+  observed_at)` 稳定排序。缺时区不猜测本地时区，整批拒绝；水位必须是
+  有限十进制数（拒绝 NaN/Inf、空值与非数字）。
+* **率定登记**的 `stations` 可为对象（站号 → 配置）或带 `station_id`
+  的配置数组。每站给：
+  - `deadband_m`（对称死区，非负标量）或 `deadband` 的
+    `{"lower_m", "upper_m"}`（要求 `lower_m <= 0 <= upper_m`，否则
+    “保持当前分支”的区间不是死区）；
+  - `initial_branch`：`rising`/`falling`（也接受 `涨水`/`退水`）；
+  - `curves`：非空数组，每项 `curve_id`（站内唯一）、`revision`
+    （≥0 整数）、`effective_from`、可选的 `effective_to`，以及
+    `rising`/`falling` 两套节点。
+* **节点**写成 `[stage_m, discharge_m3_s]` 数组或同名对象。同一分支内
+  水位必须**严格递增**（同水位节点会产生插值歧义），流量必须有限、非负
+  且随水位**不下降**（相等允许，表示该段流量不变）。
+* **整批拒绝**（不产出任何结果文件，退出码非零）：登记 JSON 语法/结构
+  错误、未知字段、重复 JSON 键、NaN/Infinity、缺时区、`effective_to`
+  不晚于 `effective_from`、同站 `curve_id` 重复、节点规则不合法、
+  **同站两版有效期交叠**、观测引用未登记站号、同站同刻水位冲突。
+
+## 22. 版本选择与分支回放
+
+### 22.1 时间决定版本（半开区间）
+
+每个版本的有效期是 `[effective_from, effective_to)`，`effective_to`
+省略表示开放式：
+
+```
+version_at(t) = 满足 effective_from <= t < effective_to 的唯一版本
+```
+
+* 观测时刻恰等于某版 `effective_from` → 该版生效，新曲线从批准时刻
+  起接管；
+* 观测时刻恰等于某版 `effective_to` → 该版已失效；若下一版正好在此刻
+  生效则用下一版，否则属于**有效期空档**；
+* 首尾相接（旧版 `effective_to` == 新版 `effective_from`）是合法交接，
+  不算交叠；真正的交叠（非零长度）在装载时整批拒绝，不做“取后一版”
+  之类的猜测；
+* 空档内的观测**留在结果表**，`status=not_converted`、
+  `reason=no_effective_curve`，不借用相邻版本外推。
+
+### 22.2 逐站回放与死区
+
+每个测站维护独立状态 `(branch, last_success_stage)`，从
+`initial_branch` 开始。对一条观测水位 `h`：
+
+```
+delta = h − last_success_stage                     （首条成功观测没有 delta）
+delta > deadband_upper   → 候选分支 = rising
+delta < deadband_lower   → 候选分支 = falling
+否则（含 delta == 上/下限）→ 保持当前 branch
+```
+
+* 比较对象是**上一条成功换算**的水位，而不是上一条观测；
+* 死区是闭区间：恰好碰到上界或下界都**不**换分支；
+* 站的判断只读本站状态。交错处理两个测站、甚至把行序完全打乱，每站的
+  分支序列与流量都不变；
+* 首条观测直接使用 `initial_branch`（`branch_decision=initial`）。
+
+### 22.3 曲线求值与“不外推”
+
+选定版本与候选分支后，在该分支节点上求值：
+
+```
+h == 节点水位           → Q = 该节点流量              （method=node_exact）
+stages[i] < h < stages[i+1]
+                        → Q = q_i + (h − h_i)(q_{i+1} − q_i)/(h_{i+1} − h_i)
+                                                     （method=linear_interpolation）
+h < stages[0] 或 h > stages[-1]
+                        → 不换算，reason=stage_out_of_curve_range
+```
+
+节点流量非负且不下降，所以插值结果也非负，且随水位不下降。内部用十进
+制运算（`Decimal`），最后按 6 位小数呈现；分支、范围与节点命中的判定
+都不依赖呈现舍入。
+
+**失败行不推进状态**：缺版本或超范围的行只写原因，`state_applied=false`，
+不更新 `last_success_stage` 与 `branch`。后续有效行仍与上一条**成功**
+水位比较——这正是“无效观测之后仍按上一条成功结果选分支”的含义。
+
+### 22.4 合并与来源行号
+
+同站同一 UTC 时刻、水位完全相同的重复行（包括用不同时区偏移写出的等价
+时刻）合并为一条计算，`record_count` 记合并条数，`source_lines` 以 `;`
+分隔列出全部原始物理行号（1 起，含表头）。同刻水位不同属于输入歧义，
+整批拒绝。行序或时区写法变化只改变行号对应的物理位置，不改变业务列。
+
+## 23. 输出、追溯与核对
+
+`stage_discharge_results.csv` 每条观测一行，按（站号, UTC 时刻）排列：
+
+| 列 | 含义 |
+| --- | --- |
+| `station_id` / `observed_at_utc` / `stage_m` / `source_lines` | 站号、UTC 时刻、原始水位、全部来源行 |
+| `status` / `discharge_m3_s` / `reason` | 是否换算、换算流量、未换算原因 |
+| `curve_id` / `revision` / `curve_effective_*_utc` | 采用的版本与有效期 |
+| `branch` / `branch_decision` | 采用分支及 `initial`/`keep_within_deadband`/`switch_to_rising`/`switch_to_falling`/`no_curve` |
+| `previous_stage_m` / `stage_delta_m` | 比较基准与差值 |
+| `curve_stage_min_m` / `curve_stage_max_m` | 所选分支曲线的覆盖范围 |
+| `lower_stage_m` / `upper_stage_m` / `lower_discharge_m3_s` / `upper_discharge_m3_s` / `interpolation_fraction` | 参与插值的节点、流量与比例（节点命中时上下节点相同、比例为 0） |
+| `calculation` | 逐项代入的文字算式 |
+| `state_applied` | 该行是否提交为新的“上一条成功水位”（仅换算成功为 `true`） |
+
+`stage_discharge_summary.json` 记录两份输入的 SHA256 与字节数、原始/合并/
+唯一观测数、结果行数、换算/未换算行数、两类未换算原因计数、逐站回放
+终态（最终分支与最后成功水位）以及口径说明。两份输出先写 `*.tmp`、
+`fsync`、回读比对，再 `os.replace` 原子替换；替换期间对已存在目标做
+`.bak` 备份，任一步失败即回滚，旧结果保持可用。任何输入错误都在替换
+之前抛出，不留下半套结果。
+
+**适用边界**：换算流量是率定关系（水位-流量曲线）推算的估计值，不是
+流速仪、水工建筑物或任何现场手段直接测得的流量；曲线本身的水位范围
+之外绝不外推，结果表中该行只给未换算原因。曲线的适用性、测站代表性与
+率定精度不在本工具结论范围内。
+
+## 24. 演示与核对
+
+```bash
+python3 -I demo/make_stage_discharge_samples.py [输出目录]
+python3 -I tests/test_stage_discharge.py
+```
+
+两个测站、三组曲线版本的合成样例覆盖：节点精确命中与节点间线性换算、
+先涨后退、差值恰在死区上下边界时保持原分支、新版在生效时刻接管旧版、
+有效期空档与曲线两端超范围均不外推、一条超范围观测之后仍按上一条成功
+结果选分支、等价重复观测合并并保留全部行号、同刻冲突与登记错误整批
+拒绝、两个测站交错处理分支互不串用。核对方式与主流程独立：
+
+* 期望值是 `EXPECTED` 中的手算字面量（含 `lower_stage_m` 等插值节点），
+  不调用被测模块的换算函数；
+* 打乱行序、改写等价时区后重算，业务列逐字段一致，且每条来源行号都
+  回查实际输入行的站号与水位；
+* 摘要中的输入 SHA256 与文件实算值一致，行数统计自洽；
+* 错误输入实际调用 CLI，确认退出码 0/2/3。

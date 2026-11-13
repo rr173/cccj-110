@@ -152,4 +152,7 @@ $PY "$ROOT/demo/fetch_demo.py" "$WORK/fetch_demo"
 step "10. 下载 -> 输入清单 -> 分析入口（端到端）"
 $PY "$ROOT/demo/fetch_pipeline_demo.py" "$WORK/fetch_pipeline"
 
+step "11. 水位-流量率定换算: 版本交接 / 死区 / 不外推 / 交错测站"
+$PY "$ROOT/demo/make_stage_discharge_samples.py" "$WORK/stage_discharge"
+
 step "全部演示完成"

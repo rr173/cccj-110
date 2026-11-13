@@ -32,6 +32,8 @@
 | 撤离可达性：赶在道路被淹前到达开放避险点的可执行行程 | `evacuation.py`, CLI `evacuation-access`, 演示 `demo/make_evac_samples.py` |
 | 状态=(路口,分钟)的精确搜索：最早抵达→最少等待→道路编号字典序 | `evacuation.py::search` |
 | 未知路况绝不当干路；车程整段区间检查；重叠冲突整体拒绝 | `evacuation.py::load_conditions` / `road_status` |
+| 按观测时刻有效的率定曲线把水位换算为流量 | `stage_discharge.py`, CLI `stage-discharge`, 演示 `demo/make_stage_discharge_samples.py` |
+| 版本半开有效期、逐站分支回放、死区闭区间、失效行不外推 | `stage_discharge.py::version_at` / `_decide_branch` / `evaluate_nodes` |
 
 ## 安装
 
@@ -113,7 +115,7 @@ bash demo/run_demo.sh
 测试：
 
 ```bash
-.venv/bin/python -I -m pytest tests/      # 61 个测试
+.venv/bin/python -I -m pytest tests/      # 61 + 34 个测试
 ```
 
 ## 输出结构
@@ -297,6 +299,95 @@ flood-exposure evacuation-access \
 - 报告保留三份输入的 SHA256 与分析参数，便于回头核对行程依据。
   **结论只在已知路况与所给行驶时间假设下成立。**
 
+## 水位-流量率定换算：`stage-discharge`
+
+测站组为同一条河段陆续批准多个**水位-流量率定曲线版本**：旧曲线只用于
+它生效期间的历史观测，新曲线只从批准时刻起生效。这个命令把观测表里
+每一行的水位，按**观测发生时刻当时有效**的曲线版本与流域回放分支换算为
+流量，并把每个数的来历写在同一行里。纯本地、纯标准库实现，不影响洪水
+栅格 / DEM / 雨量 / 撤离计算链。
+
+```bash
+# 生成覆盖全部规定场景的样例并运行独立手算断言（无需第三方依赖）
+python3 -I demo/make_stage_discharge_samples.py sample_stage
+
+# 正式换算：观测 CSV + 率定登记 JSON -> 结果表 + 运行摘要
+flood-exposure stage-discharge \
+  --observations sample_stage/observations.csv \
+  --registry sample_stage/registry.json \
+  --output-dir sample_stage/stage_discharge_output
+```
+
+观测 CSV 固定三列 `station_id,observed_at,stage_m`，时间必须带时区偏移
+（如 `2026-01-05T08:00:00+08:00`），内部统一换算 UTC 再按站号、时刻排序。
+率定登记示例：
+
+```json
+{
+  "schema_version": 1,
+  "stations": {
+    "R1": {
+      "deadband_m": 0.10,
+      "initial_branch": "rising",
+      "curves": [
+        {"curve_id": "R1-2025", "revision": 3,
+         "effective_from": "2026-01-01T00:00:00+00:00",
+         "effective_to": "2026-02-01T00:00:00+00:00",
+         "rising":  [[0.0, 0.0], [1.0, 10.0], [2.0, 30.0]],
+         "falling": [[0.0, 0.0], [1.0, 4.0], [2.0, 18.0]]},
+        {"curve_id": "R1-2026", "revision": 7,
+         "effective_from": "2026-03-01T00:00:00+00:00",
+         "rising":  [[0.0, 2.0], [1.0, 12.0], [2.0, 32.0]],
+         "falling": [[0.0, 1.0], [1.0, 5.0], [2.0, 19.0]]}
+      ]
+    }
+  }
+}
+```
+
+`deadband_m` 也可写成 `{"lower_m": -0.3, "upper_m": 0.05}` 的不对称死区；
+节点可写成 `[水位, 流量]` 数组或 `{"stage_m":…, "discharge_m3_s":…}`。
+版本有效期是半开区间 `[effective_from, effective_to)`，`effective_to`
+省略表示开放式；首尾恰好相接是合法交接；同站任何两版不得真正交叠。
+
+口径要点（完整说明见 `docs/METHODOLOGY.md` 第 21–23 节）：
+
+- **时间决定版本**：观测时刻落在哪个版本的有效期内就用哪一版；恰好等于
+  生效时刻用新版、恰好等于失效时刻则不再属于旧版。空档里的观测留在
+  产物里，`status=not_converted`、`reason=no_effective_curve`；
+- **逐站独立回放**：每站从 `initial_branch` 起，只与**上一条成功换算**
+  的水位比较。差值严格高于死区上限转涨水、严格低于下限转退水；差值落在
+  死区闭区间内（**包括恰好碰到边界**）保持当前分支。一个站的判断不读取
+  也不改变另一个站的状态；
+- **曲线换算**：在包围水位的两个节点间线性插值，水位恰为节点时直接取
+  节点值。节点水位必须严格递增、流量必须有限非负且随水位不下降；
+  水位超出所选分支曲线覆盖范围时**绝不外推**，该行写
+  `reason=stage_out_of_curve_range`；
+- **失败行不推进状态**：缺曲线或超范围的行仍保留在结果表，但不更新该站
+  的上一条成功水位与分支，因此后续有效行仍按上一条成功结果选分支；
+- **合并与拒绝**：同站同一 UTC 时刻、水位完全相同的重复观测合并为一条
+  计算（`record_count` 与 `source_lines` 保留全部原始物理行号）；同刻
+  水位不同属于输入歧义，整批拒绝。登记格式错误、节点顺序/流量规则
+  非法、有效期交叠、引用未登记站号、缺时区等同样整批拒绝，退出码非零，
+  不写出任何“看似完整”的结果；
+- **结果表每行都有推导依据**：采用的 `curve_id`/`revision`、版本起止、
+  分支与决策（`initial` / `keep_within_deadband` / `switch_to_rising` /
+  `switch_to_falling`）、参与插值的上下节点及各自流量、插值比例、
+  `calculation` 文字式、来源行号与 `state_applied`；
+- **摘要**：两份输入的 SHA256 与字节数、原始/合并/唯一观测数、换算与未
+  换算行数、两类未换算原因计数、逐站回放终态，以及“换算流量是率定关系
+  推算值、并非直接测得”的声明。
+
+输出 `stage_discharge_results.csv` 按（站号, UTC 时刻）排列；
+`stage_discharge_summary.json` 记录输入指纹与统计。两份文件都先写临时
+文件、回读校验再原子替换，失败时旧结果保持可用。重新排列观测文件、
+改写等价时区表示或交错不同站点的行，不改变同一观测的版本、分支与流量，
+来源行号仍指向实际输入。
+
+```bash
+python3 -I tests/test_stage_discharge.py
+```
+
 ## 命令一览
 
 | 子命令 | 作用 |
@@ -311,3 +402,4 @@ flood-exposure evacuation-access \
 | `delineate` | 从 DEM + 测站表推导 D8 流向、贡献面积与测站汇水分区 |
 | `rainfall` | 本地整理累计翻斗读数：逐段雨量 CSV、降雨事件 CSV、带 SHA256 的摘要 JSON |
 | `evacuation-access` | 撤离可达性：按（路口,分钟）搜索赶在道路被淹前到达开放避险点的可执行行程 |
+| `stage-discharge` | 按观测时刻有效的率定曲线版本把水位换算为流量（逐站分支回放、死区、不外推） |

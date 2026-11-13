@@ -13,6 +13,8 @@ releases         列出已发布版本
 rainfall         本地整理雨量站累计翻斗读数：逐段雨量 + 降雨事件 + 质量摘要
 evacuation-access  撤离可达性：按“地点×分钟”计算赶在道路被淹前到达开放
                  避险点的可执行行程（纯本地、标准库）
+stage-discharge  按观测时刻有效的率定曲线版本把测站水位换算为流量
+                 （逐站分支回放、死区、不外推；纯本地、标准库）
 """
 from __future__ import annotations
 
@@ -307,6 +309,39 @@ def cmd_delineate(args) -> int:
     return 0
 
 
+def cmd_stage_discharge(args) -> int:
+    # 纯标准库本地计算，延迟导入以保持子命令隔离
+    from .stage_discharge import (
+        StageDischargeInputError,
+        StageDischargeOutputError,
+        StageDischargeRegistryError,
+        process_stage_discharge,
+    )
+
+    try:
+        summary = process_stage_discharge(
+            args.observations, args.registry, args.output_dir)
+    except StageDischargeRegistryError as exc:
+        print(f"[登记错误] {exc}", file=sys.stderr)
+        return 2
+    except StageDischargeInputError as exc:
+        print(f"[观测输入错误] {exc}", file=sys.stderr)
+        return 3
+    except StageDischargeOutputError as exc:
+        print(f"[写出失败] {exc}", file=sys.stderr)
+        return 1
+
+    print(json.dumps({
+        "output_dir": args.output_dir,
+        "results_csv": "stage_discharge_results.csv",
+        "summary_json": "stage_discharge_summary.json",
+        "counts": summary["counts"],
+        "reason_counts": summary["reason_counts"],
+        "disclaimer": summary["disclaimer"],
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="flood-exposure",
@@ -453,6 +488,35 @@ def build_parser() -> argparse.ArgumentParser:
                      help="可选：报告 JSON 写出路径（临时文件 + 原子替换）；"
                           "无论是否指定，报告都会打印到标准输出")
     pev.set_defaults(func=cmd_evacuation_access)
+
+    # ---- stage-discharge -----------------------------------------------
+    psd = sub.add_parser(
+        "stage-discharge",
+        help="按观测时刻有效的率定曲线版本把水位换算为流量（逐站分支回放）",
+        description="读取测站观测 CSV（station_id,observed_at,stage_m；时间"
+                    "必须带时区）与率定登记 JSON（每站死区、初始分支、若干"
+                    "曲线版本及其涨水/退水节点），按观测发生时有效的版本与"
+                    "回放分支做线性换算。同站同刻同水位的重复观测合并并保留"
+                    "全部原始行号；无适用版本或超出曲线覆盖范围的行不外推，"
+                    "写明原因且不改变该站上一条成功水位与分支。登记非法、"
+                    "有效期交叠、引用未登记站号、同刻水位冲突等整批拒绝。",
+        epilog="换算流量是率定关系推算值，不是直接测得的流量。"
+               "退出码：0=成功，1=写出失败，2=登记文件非法，"
+               "3=观测输入错误（整批拒绝，不产出结果）。",
+    )
+    psd.add_argument("--observations", required=True,
+                     help="观测 CSV：station_id,observed_at,stage_m；"
+                          "observed_at 必须带时区偏移")
+    psd.add_argument("--registry", required=True,
+                     help="率定登记 JSON：stations 下每站给 deadband_m "
+                          "（或 deadband 的 lower_m/upper_m）、initial_branch "
+                          "与 curves（curve_id、revision、effective_from、"
+                          "effective_to、rising、falling 节点）")
+    psd.add_argument("--output-dir", required=True, dest="output_dir",
+                     help="输出目录：stage_discharge_results.csv 与 "
+                          "stage_discharge_summary.json；先写临时文件并回读"
+                          "校验，再原子替换，失败不留下半成品")
+    psd.set_defaults(func=cmd_stage_discharge)
     return p
 
 
