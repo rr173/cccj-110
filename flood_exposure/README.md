@@ -22,6 +22,7 @@
 | NoData 超闸门拒绝发布，不静默零填补 | `publishing.py::check_gate` / `PublishGateError` |
 | 流域明细查询 + 计算清单 | `query.py`, CLI `query` / `manifest` |
 | 独立参考计算对照 | `reference.py`（规则点阵，独立代码路径） |
+| 远程大文件可恢复下载（真实 HTTP + 断点续传） | `fetch.py`, CLI `fetch`, 演示 `demo/fetch_demo.py` |
 
 ## 安装
 
@@ -60,18 +61,50 @@ python3 get-pip.py --prefix=.venv          # 无 ensurepip 的环境
 .venv/bin/flood-exposure query --output-root out --basin-id B
 .venv/bin/flood-exposure manifest --output-root out --basin-id B
 .venv/bin/flood-exposure releases --output-root out
+
+# 6. 远程水深：可恢复地拉到本地，再交给 make-inventory / run
+.venv/bin/flood-exposure fetch \
+  https://supplier.example/depth/T00.tif downloads/depth_T00.tif \
+  --chunk-bytes 4194304 \
+  --expected-sha256 <期望的整体 SHA256>
+.venv/bin/flood-exposure make-inventory --depth T00=downloads/depth_T00.tif ...
 ```
 
-一键端到端演示（含发布前 SIGTERM 中止、闸门拒绝、参考对照）：
+`fetch` 的字节语义：
+
+* 首次 `HEAD` 探测**总长度与强 ETag**；弱 ETag / 无 ETag 一律拒绝续传。
+* 进度记录 `<target>.fetchstate.json` 按块保存区间与内容 SHA256；
+  恢复时读取 `<target>.fetchpart` 里的真实字节逐块核对，不符的块重取。
+* 每条分段请求带 `If-Match` / `If-Range`；206 的 `Content-Range` 起止、
+  总长度、`Content-Length` 与真实读到的字节数全部核对；中途断连不记块。
+* 服务器忽略 Range 返回 200 时，不写进任何偏移：作废本轮分段进度，
+  从 0 流式重传并再次核对强 ETag / 长度 / 最终 URL。
+* 416 只有在本地所有区间已校验且长度一致时才进入最终核对，否则是协议错误。
+* 全部区间完整 + 临时文件实际长度一致 + 逐块摘要 + 整体 SHA256（若给定）
+  通过后才 `os.replace` 到目标；失败期间旧目标保持可用。
+* `--fresh` 显式放弃临时进度，按当前远端版本重新获取。
+* 同一目标用非阻塞 `flock` 独占：后启动的进程立即以退出码 3 报占用；
+  进程异常退出后内核释放锁，新进程可直接接管。
+* 成功后打印本地路径、字节数、SHA256，并写 `<target>.provenance.json`
+  （请求 URL、最终 URL、强 ETag、总长度、实际摘要）。
+
+一键端到端演示（含发布前 SIGTERM 中止、闸门拒绝、参考对照、下载故障场景）：
 
 ```bash
 bash demo/run_demo.sh
 ```
 
+单独的下载演示（真实本地 HTTP 服务 + 逐条断言）：
+
+```bash
+.venv/bin/python -I demo/fetch_demo.py            # 断连/篡改/换版/200/伪造/416/争用
+.venv/bin/python -I demo/fetch_pipeline_demo.py   # 下载 -> make-inventory -> run
+```
+
 测试：
 
 ```bash
-.venv/bin/python -I -m pytest tests/      # 29 个测试
+.venv/bin/python -I -m pytest tests/      # 61 个测试
 ```
 
 ## 输出结构
@@ -87,6 +120,11 @@ out/
       gate_report.json       # 闸门结论
       weight_cache/<hash>.json
       SUCCESS                # 完整发布标记
+
+downloads/
+  depth_T00.tif            # fetch 成功后才原子替换到此路径
+  depth_T00.tif.provenance.json   # 来源记录（请求/最终 URL、强 ETag、长度、摘要）
+  # 失败/进行中：.fetchpart（临时字节）、.fetchstate.json（进度）、.fetchlock
 ```
 
 ## 业务口径（详见 docs/METHODOLOGY.md）
@@ -106,6 +144,7 @@ out/
 
 | 子命令 | 作用 |
 | --- | --- |
+| `fetch` | 远程大文件可恢复下载（探测身份、分块校验、断点续传、摘要核对） |
 | `make-inventory` | 扫描输入，生成带 sha256/字节数的清单 JSON |
 | `run` | 全量处理并原子发布 |
 | `run-incremental` | 边界增量（缓存驱动，与 `run` 同运行器） |

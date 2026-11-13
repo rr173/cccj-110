@@ -2,6 +2,7 @@
 
 子命令
 ------
+fetch            把远程 GeoTIFF 可恢复地拉到本地路径（断点续传 + 摘要核对）
 make-inventory   扫描输入文件生成带 sha256 的输入清单 JSON
 run              全量处理（三个输入清单摘要 -> 暂存 -> 闸门 -> 原子发布）
 run-incremental  边界增量处理（复用权重缓存，只重建几何变化的流域）
@@ -59,6 +60,54 @@ def _build_inventory(args) -> InputInventory:
             sha256=sha256_file(pfp), size_bytes=pfp.stat().st_size,
         ),
     )
+
+
+def cmd_fetch(args) -> int:
+    # 延迟导入：`fetch` 只需要标准库，不必为了下载而加载 numpy/rasterio
+    # （也让“目标被占用”这类错误不必等待重依赖导入）。
+    from .fetch import FetchError, FetchLockedError, HttpOptions, fetch
+
+    def log(msg: str) -> None:
+        print(f"[fetch] {msg}", file=sys.stderr)
+
+    opts = HttpOptions(
+        timeout=args.timeout,
+        max_retries=args.max_retries,
+        retry_backoff=args.retry_backoff,
+        log=log,
+    )
+    try:
+        result = fetch(
+            args.url,
+            args.target,
+            args.chunk_bytes,
+            expected_sha256=args.expected_sha256,
+            fresh=args.fresh,
+            opts=opts,
+        )
+    except FetchLockedError as exc:
+        log(f"失败: {exc}")
+        return 3
+    except FetchError as exc:
+        log(f"失败: {exc}")
+        return 1
+    except ValueError as exc:
+        log(f"参数错误: {exc}")
+        return 2
+    print(json.dumps({
+        "path": str(result.path),
+        "size_bytes": result.size_bytes,
+        "sha256": result.sha256,
+        "request_url": result.identity.request_url,
+        "final_url": result.identity.final_url,
+        "strong_etag": result.identity.etag,
+        "source_record": str(result.source_record),
+        "resumed_chunks": result.resumed_chunks,
+        "refetched_chunks": result.refetched_chunks,
+        "whole_stream_restarts": result.whole_stream_restarts,
+        "retries": result.retries,
+    }, ensure_ascii=False, indent=2))
+    return 0
 
 
 def cmd_make_inventory(args) -> int:
@@ -142,6 +191,27 @@ def build_parser() -> argparse.ArgumentParser:
         description="流域洪水暴露度分析：等面积面积权重、可追溯、暂存发布",
     )
     sub = p.add_subparsers(dest="command", required=True)
+
+    # ---- fetch ---------------------------------------------------------
+    pf = sub.add_parser(
+        "fetch",
+        help="把远程大文件可恢复地拉到本地路径（分段校验、断点续传、摘要核对）",
+    )
+    pf.add_argument("url", help="请求 URL；供应商重定向后的最终 URL 会被记录")
+    pf.add_argument("target", help="最终本地文件路径；失败期间旧文件保持可用")
+    pf.add_argument("--chunk-bytes", type=int, required=True,
+                    dest="chunk_bytes", help="每个分段请求的最大字节数")
+    pf.add_argument("--expected-sha256", default=None, dest="expected_sha256",
+                    help="可选：整个对象的期望 SHA256，不匹配则不替换目标")
+    pf.add_argument("--fresh", action="store_true",
+                    help="放弃同目标的临时进度与临时文件，按当前远端版本重下")
+    pf.add_argument("--timeout", type=float, default=30.0,
+                    help="单次请求的套接字超时秒数 (默认 30)")
+    pf.add_argument("--max-retries", type=int, default=4, dest="max_retries",
+                    help="断连/可重试服务错误的最大重试次数 (默认 4)")
+    pf.add_argument("--retry-backoff", type=float, default=0.5,
+                    dest="retry_backoff", help="指数退避基数秒 (默认 0.5)")
+    pf.set_defaults(func=cmd_fetch)
 
     # ---- make-inventory ------------------------------------------------
     pi = sub.add_parser("make-inventory", help="生成带 sha256 的输入清单")

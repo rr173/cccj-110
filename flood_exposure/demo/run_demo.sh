@@ -146,4 +146,10 @@ print(f"wet_fraction 最大偏差 {worst:.4f} (点阵 K=48, O(1/K) 容差 0.06) 
       "对照通过" if worst < 0.06 else "对照失败")
 PYEOF
 
+step "9. 远程水深可恢复下载（可控 HTTP 服务，真实请求与断言）"
+$PY "$ROOT/demo/fetch_demo.py" "$WORK/fetch_demo"
+
+step "10. 下载 -> 输入清单 -> 分析入口（端到端）"
+$PY "$ROOT/demo/fetch_pipeline_demo.py" "$WORK/fetch_pipeline"
+
 step "全部演示完成"
