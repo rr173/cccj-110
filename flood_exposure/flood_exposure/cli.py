@@ -15,6 +15,8 @@ evacuation-access  撤离可达性：按“地点×分钟”计算赶在道路�
                  避险点的可执行行程（纯本地、标准库）
 stage-discharge  按观测时刻有效的率定曲线版本把测站水位换算为流量
                  （逐站分支回放、死区、不外推；纯本地、标准库）
+bulletin         接收固定格式水情通报：整理观测表与待核清单
+                 （有限句法规则抽取，不理解任意自然语言；纯本地、标准库）
 """
 from __future__ import annotations
 
@@ -342,6 +344,44 @@ def cmd_stage_discharge(args) -> int:
     return 0
 
 
+def cmd_bulletin(args) -> int:
+    # 纯标准库本地处理，延迟导入以保持子命令隔离（不触碰栅格/DEM 链路）
+    from .bulletin import (
+        BulletinConfigError,
+        BulletinInputError,
+        BulletinOutputError,
+        process_bulletin,
+    )
+
+    try:
+        summary = process_bulletin(
+            args.text, args.stations, args.published_at, args.output_dir)
+    except BulletinConfigError as exc:
+        print(f"[配置错误] {exc}", file=sys.stderr)
+        return 2
+    except BulletinInputError as exc:
+        print(f"[通报读取失败] {exc}", file=sys.stderr)
+        return 3
+    except BulletinOutputError as exc:
+        print(f"[写出失败] {exc}", file=sys.stderr)
+        return 1
+
+    counts = summary["counts"]
+    print(json.dumps({
+        "output_dir": args.output_dir,
+        "observations_csv": "bulletin_observations.csv",
+        "review_csv": "bulletin_review.csv",
+        "summary_json": "bulletin_summary.json",
+        "counts": counts,
+    }, ensure_ascii=False, indent=2))
+    if counts["conflict"] or counts["other_review"]:
+        print(f"[部分接收] 存在待核条目（冲突 {counts['conflict']}，"
+              f"其他 {counts['other_review']}），已确认结果仍已写出",
+              file=sys.stderr)
+        return 4
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="flood-exposure",
@@ -517,6 +557,56 @@ def build_parser() -> argparse.ArgumentParser:
                           "stage_discharge_summary.json；先写临时文件并回读"
                           "校验，再原子替换，失败不留下半成品")
     psd.set_defaults(func=cmd_stage_discharge)
+
+    # ---- bulletin ------------------------------------------------------
+    pb = sub.add_parser(
+        "bulletin",
+        help="接收固定格式水情通报：整理观测表与待核清单（纯本地、标准库）",
+        description="""\
+把固定格式的本地中文水情通报整理为观测表与待核清单。这是【有限句法】的
+规则抽取，不理解任意自然语言；不在句法内的疑似实测内容进入待核清单，
+不静默丢弃。只接收通报明确给出的实测水位/流量：不推算流量、不预测。
+
+有限句法：
+  空行划分段落；段内可有独立标题行“日期：…”“时刻：…”“测站：…”
+  （冒号中英文均可，整行只能是标题）。标题只向后生效，空行清掉全部
+  标题，绝不从后一条回填；陈述里的显式信息只管本条，不改标题。
+  陈述以句号(。)、分号(；;)或换行分开，逗号(，,)连接同一陈述的字段。
+  日期：2026-11-12 / 2026年11月12日 / 11月12日 / 今日 / 昨日 / 今8时；
+        月日未写年取发布当年，晚于发布日才退上一年；非法日期不跨年猜补。
+  时刻：8时 / 8时30分 / 08:30；24时仅整点合法并归入次日零点。
+  数值：水位 数字 (米|厘米|毫米)、流量 数字 立方米每秒，可带正负号；
+        缺报/未测/缺测/破折号记为缺测，绝不当零；水位负值合法，流量
+        负值待核。警戒水位等参考量、“较昨日涨/落”比较量与含
+        “预计/预报/将达到”的分句只作非实测内容。
+
+站名匹配：对照表列正式站号（字符串，前导零有意义）、名称与别名；同一
+别名对应两站时进入待核，不取第一项。匹配从左到右、同一起点最长优先；
+左邻不能是名称构成字符（汉字/字母/数字），单字别名右邻也不能——所以
+“江水上涨”里的“江”不算测站，而“甲站今8时”里的“甲站”算。
+
+每条观测为站名、日期、时刻、数值分别记录原文位置（0 起字符半开区间 +
+1 起行列，格式 c起-止@L行C列-L行C列），继承标题时指向标题行本身；
+用这些位置切回原文必须得到记录的文字。""",
+        epilog="退出码: 0=全部接收；4=部分接收（存在待核条目，已确认结果"
+               "仍已写出）；2=站名对照或发布时间非法；3=通报文本无法读取；"
+               "1=写出失败。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pb.add_argument("--text", required=True,
+                    help="通报文本文件路径 (UTF-8)")
+    pb.add_argument("--published-at", required=True, dest="published_at",
+                    help="发布时间，必须带时区偏移，如 "
+                         "2026-11-13T08:00:00+08:00；采样时刻按该时区解释"
+                         "并写成 UTC")
+    pb.add_argument("--stations", required=True,
+                    help="站名对照 JSON：stations 数组，每项给 station_id "
+                         "（字符串，前导零有意义）、name 与可选 aliases")
+    pb.add_argument("--output-dir", required=True, dest="output_dir",
+                    help="结果目录：bulletin_observations.csv / "
+                         "bulletin_review.csv / bulletin_summary.json；"
+                         "先写临时文件并回读校验，再原子替换")
+    pb.set_defaults(func=cmd_bulletin)
     return p
 
 
