@@ -2,14 +2,22 @@
 
 受淹人口的保守估计 (业务口径)
 ------------------------------
-对人口格 t，流域 B 的面积份额 w(B,t)=area(B∩t)/area(t)。格内人口按面积
-均摊到单位面积，因此该流域在该格“拥有”的人口为 w(B,t)·pop(t)。
+人口格 t 内人口按面积均匀分布，流域 B 与 t 的真实交集是 B∩t。格内受淹
+人口不能写成“流域占格比例 × 格内受淹比例”的乘积 —— 两个比例各自都不知道
+受淹区与流域是否在同一侧。正确做法是把水深各类别的面积直接取三向交集：
 
-格内受淹面积比例 wet_frac(t) 由水深栅格的等面积相交权重得到。于是
+    A_class(B,t) = Σ_s area(s ∩ t ∩ B)      class ∈ {wet, dry, nodata}
+    A_oob(B,t)   = area(B ∩ t) − wet − dry − nodata
 
-    exposed_pop(B, 时次) = Σ_t w(B,t) · pop(t) · wet_frac(t)
+于是
 
-NoData / 栅格外 (OOB) 面积**不做零填补**：它们不进入 wet_frac，因此
+    exposed_pop(B, 时次) = Σ_t pop(t) · A_wet(B,t) / area(t)
+    weighted_pop(B)      = Σ_t pop(t) · area(B∩t) / area(t)
+    missing_fraction     = (Σ_t A_nodata(B,t) + A_oob(B,t)) / Σ_t area(B∩t)
+
+其中 area(t) 是原人口格面积（人口在原格内均匀分布，受淹人数按真实受淹
+交集占原格的面积份额计算）；缺测比例的分母是该流域被人口网格覆盖的面积。
+NoData / 栅格外 (OOB) 面积**不做零填补**：它们不进入受淹面积，因此
 exposed_pop 是一个下界保守估计，缺测规模通过 missing_fraction 与
 质量标记单独披露。人口网格自身的 NoData 格整体剔除并打 POP_RASTER_NODATA。
 """
@@ -100,6 +108,8 @@ def compute_basin_exposure(
     overlap_ids: list[str] | None = None,
 ) -> BasinExposure:
     cells = sorted(table.fractions.keys())
+    # 类别面积必须是 area(源像元 ∩ 人口格 ∩ 流域)：把流域几何直接传进
+    # 重采样器，才能知道受淹/缺测落在格的哪一侧，而不是在格级上平均。
     depth_res = resample_depth_windowed(
         depth_path=depth_path,
         pop_transform=pop.transform,
@@ -108,34 +118,36 @@ def compute_basin_exposure(
         target_cells=set(cells),
         threshold=threshold,
         tile=tile,
+        basin_geom_work=basin.geom_work,
     )
     pop_values = _read_pop_values(pop, cells)
 
     weighted_pop = 0.0
     exposed = 0.0
     wet_area = dry_area = nodata_area = oob_area = 0.0
-    covered_weight = 0.0          # 流域在人口格上的权重总面积 (m²)
+    covered_weight = 0.0          # Σ area(B∩t)，流域被人口网格覆盖的面积
     pop_nodata_cells = 0
 
     for key in cells:
-        w = table.fractions[key]                 # 流域 × 人口格面积份额
-        cell_area = table.cell_areas_m2[key]
         d = depth_res[key]
+        cell_area = d["cell_area_m2"]      # 原人口格面积
+        slice_area = d["basin_slice_area_m2"]  # area(B∩t)
         pop_val = pop_values[key]
 
-        covered_weight += w * cell_area
-        wet_area += w * d["wet_area_m2"]
-        dry_area += w * d["dry_area_m2"]
-        nodata_area += w * d["nodata_area_m2"]
-        oob_area += w * d["oob_area_m2"]
+        # 各流域之间按真实相交面积分摊人口与类别面积
+        covered_weight += slice_area
+        wet_area += d["wet_area_m2"]
+        dry_area += d["dry_area_m2"]
+        nodata_area += d["nodata_area_m2"]
+        oob_area += d["oob_area_m2"]
 
         if np.isnan(pop_val):
             pop_nodata_cells += 1
             continue
-        weighted_pop += w * pop_val
-        # wet_fraction 是格内受淹面积比例；NoData/OOB 不在其中，
-        # 故受淹人口为保守下界，缺测另计。
-        exposed += w * pop_val * d["wet_fraction"]
+        weighted_pop += pop_val * slice_area / cell_area if cell_area > 0 else 0.0
+        # 人口在原格内均匀分布：受淹人数 = pop × A_wet(B,t)/area(t)。
+        # NoData/OOB 不在 A_wet 中，故为保守下界，缺测另计。
+        exposed += pop_val * d["wet_area_m2"] / cell_area if cell_area > 0 else 0.0
 
     missing_area = nodata_area + oob_area
     denom = covered_weight if covered_weight > 0 else 0.0

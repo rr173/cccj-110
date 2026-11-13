@@ -21,6 +21,15 @@ NoData 的业务含义
     A_nodata(t)= Σ_s area(s ∩ t)  对 NoData 像元
     A_oob(t)   = area(t) - 以上三者  (人口格落在水深栅格范围之外)
 
+把这些面积归到流域 B 时，必须用三向交集，而不是“格内比例 × 流域份额”：
+
+    A_class(B, t) = Σ_s area(s ∩ t ∩ B)     class ∈ {wet, dry, nodata}
+    A_oob(B, t)   = area(t ∩ B) - 以上三者
+
+受淹面积只来自真正与流域相交的水深像元，NoData 面积同理；缺测比例的分母
+是流域被人口网格覆盖的面积 area(t ∩ B)。若调用方不传 basin_geom_work，
+则退化为整格口径 (B 视为覆盖整个目标格)。
+
 权重完全由等面积投影下的几何相交决定，与读取窗口的切分无关；窗口只决定
 每次从磁盘读多少像元。
 """
@@ -92,6 +101,7 @@ class CellAccum:
     wet: float = 0.0
     dry: float = 0.0
     nodata: float = 0.0
+    slice_area: float = 0.0        # area(人口格 ∩ 流域)，本格归到该流域的覆盖面积
 
     @property
     def observed(self) -> float:
@@ -115,6 +125,10 @@ class AreaWeightedResampler:
         淹没水深阈值。
     tile:
         源栅格窗口读取块大小；改变它不改变任何累加结果。
+    basin_geom_work:
+        流域在 work_crs 下的几何。给定时所有类别面积与覆盖面积都限制在
+        area(源像元 ∩ 人口格 ∩ 流域) / area(人口格 ∩ 流域)；不给则按整格
+        口径。空间归属由几何相交决定，不能用两个比例相乘来近似。
     """
 
     def __init__(
@@ -126,6 +140,7 @@ class AreaWeightedResampler:
         target_cells: set[tuple[int, int]],
         threshold: float,
         tile: int = 256,
+        basin_geom_work: object | None = None,
     ):
         self.ds = depth_ds
         self.info = raster_info(depth_ds)
@@ -133,22 +148,37 @@ class AreaWeightedResampler:
         self.threshold = float(threshold)
         self.tile = tile
         self.target_cells = target_cells
+        self.basin_geom_work = basin_geom_work
 
         self.depth_to_work = make_transformer(self.info.crs, work_crs)
         self.pop_to_work = make_transformer(pop_crs, work_crs)
 
-        # 目标格的工作 CRS 四边形与面积
+        # 目标格的工作 CRS 四边形、面积，以及归到流域的交集几何/面积
         self.cell_quads: dict[tuple[int, int], object] = {}
         self.cell_areas: dict[tuple[int, int], float] = {}
+        self.basin_slices: dict[tuple[int, int], object] = {}
+        self.slice_areas: dict[tuple[int, int], float] = {}
+        basin_prep = prep(basin_geom_work) if basin_geom_work is not None else None
         for (row, col) in target_cells:
             quad = cell_footprint(pop_transform, self.pop_to_work, row, col)
             self.cell_quads[(row, col)] = quad
             self.cell_areas[(row, col)] = quad.area
+            if basin_prep is None:
+                self.basin_slices[(row, col)] = quad
+                self.slice_areas[(row, col)] = quad.area
+            elif basin_prep.contains(quad):
+                # 格完全在流域内：无需再做一次 intersection
+                self.basin_slices[(row, col)] = quad
+                self.slice_areas[(row, col)] = quad.area
+            else:
+                inter = quad.intersection(basin_geom_work)
+                self.basin_slices[(row, col)] = inter
+                self.slice_areas[(row, col)] = inter.area
 
         # 水深栅格范围 (工作 CRS)，用于区分 NoData 与“栅格外 (OOB)”
         self.depth_footprint = prep(self.info.footprint_work(self.depth_to_work))
         self.acc: dict[tuple[int, int], CellAccum] = {
-            k: CellAccum() for k in target_cells
+            k: CellAccum(slice_area=self.slice_areas[k]) for k in target_cells
         }
 
     # ------------------------------------------------------------------ #
@@ -173,7 +203,8 @@ class AreaWeightedResampler:
 
         local_cells = [
             k for k in self.target_cells
-            if self.cell_quads[k].intersects(win_box_work)
+            if self.slice_areas[k] > 0
+            and self.basin_slices[k].intersects(win_box_work)
         ]
         if not local_cells:
             return
@@ -202,10 +233,12 @@ class AreaWeightedResampler:
                     continue
                 src_prep = prep(src_quad)
                 for key in local_cells:
-                    tq = self.cell_quads[key]
-                    if not src_prep.intersects(tq):
+                    # 三向交集 area(源像元 ∩ 人口格 ∩ 流域)：类别面积直接
+                    # 取自与流域真正相交的那一部分，而非两个比例的乘积
+                    basin_slice = self.basin_slices[key]
+                    if not src_prep.intersects(basin_slice):
                         continue
-                    inter_area = src_quad.intersection(tq).area
+                    inter_area = src_quad.intersection(basin_slice).area
                     if inter_area <= 0:
                         continue
                     acc = self.acc[key]
@@ -219,21 +252,25 @@ class AreaWeightedResampler:
 
     # ------------------------------------------------------------------ #
     def finalize(self) -> dict[tuple[int, int], dict]:
-        """把累加器转成带 OOB 与缺测比例的结果。"""
+        """把累加器转成该流域口径下的类别面积与比例。
+
+        所有面积都是 area(源像元 ∩ 人口格 ∩ 流域)，OOB 是 area(人口格 ∩ 流域)
+        减去三类已知面积；分母同理用流域覆盖面积，而不是整格面积。
+        """
         out: dict[tuple[int, int], dict] = {}
         for key, acc in self.acc.items():
             cell_area = self.cell_areas[key]
+            slice_area = acc.slice_area
             covered = acc.wet + acc.dry + acc.nodata
-            # 数值保护：相交面积之和理论上 <= 像元面积，投影抖动时截断
-            covered = min(covered, cell_area)
-            oob = max(cell_area - covered, 0.0)
-            # 只有与水深栅格范围不相交的部分才会计 OOB；与栅格范围相交
-            # 但没有任何源像元贡献的情形理论上不发生（全覆盖栅格）。
-            wet_frac = acc.wet / cell_area if cell_area > 0 else 0.0
-            nodata_frac = acc.nodata / cell_area if cell_area > 0 else 0.0
-            oob_frac = oob / cell_area if cell_area > 0 else 0.0
+            # 数值保护：相交面积之和理论上 <= 流域覆盖面积，投影抖动时截断
+            covered = min(covered, slice_area)
+            oob = max(slice_area - covered, 0.0)
+            wet_frac = acc.wet / slice_area if slice_area > 0 else 0.0
+            nodata_frac = acc.nodata / slice_area if slice_area > 0 else 0.0
+            oob_frac = oob / slice_area if slice_area > 0 else 0.0
             out[key] = {
                 "cell_area_m2": cell_area,
+                "basin_slice_area_m2": slice_area,
                 "wet_area_m2": acc.wet,
                 "dry_area_m2": acc.dry,
                 "nodata_area_m2": acc.nodata,
@@ -254,11 +291,17 @@ def resample_depth_windowed(
     target_cells: set[tuple[int, int]],
     threshold: float,
     tile: int = 256,
+    basin_geom_work: object | None = None,
 ) -> dict[tuple[int, int], dict]:
-    """便捷封装：打开栅格、窗口重采样、返回 finalize 后的逐格结果。"""
+    """便捷封装：打开栅格、窗口重采样、返回 finalize 后的逐格结果。
+
+    给定 basin_geom_work 时，返回的 wet/nodata/oob 面积与比例都是该流域
+    与实际相交的水深像元的交集口径；不给则按整格口径。
+    """
     with rasterio.open(depth_path) as ds:
         r = AreaWeightedResampler(
-            ds, pop_transform, pop_crs, work_crs, target_cells, threshold, tile
+            ds, pop_transform, pop_crs, work_crs, target_cells, threshold, tile,
+            basin_geom_work=basin_geom_work,
         )
         r.run()
         return r.finalize()

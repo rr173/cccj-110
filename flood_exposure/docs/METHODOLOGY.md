@@ -17,12 +17,13 @@ float64），避免大整数填充值的精度错配。
 **发布闸门**：每个 (流域, 时次) 的
 
 ```
-missing_fraction = (nodata_area + oob_area) / 流域权重覆盖面积
+missing_fraction = (nodata_area + oob_area) / area(B ∩ 人口网格)
 ```
 
-超过配置的 `max_missing_fraction` 时，该运行拒绝发布（`PublishGateError`），
-暂存区整体销毁，`releases/current` 保持指向上一完整版本。系统不会用 0
-替代 NoData 来“凑出”一个结果。
+分母是**该流域被人口网格覆盖的面积**（各人口格 `area(B∩P)` 之和），
+不是整个人口格面积。超过配置的 `max_missing_fraction` 时，该运行拒绝发布
+（`PublishGateError`），暂存区整体销毁，`releases/current` 保持指向上一完整
+版本。系统不会用 0 替代 NoData 来“凑出”一个结果。
 
 人口网格自身的 NoData 格不赋零人口，而是整体剔除并打 `POP_RASTER_NODATA`。
 
@@ -38,25 +39,29 @@ missing_fraction = (nodata_area + oob_area) / 流域权重覆盖面积
 w(B, P) = area( intersection(B, P) ) / area(P)        # ∈ [0, 1]
 ```
 
-水深源像元 s 到人口格 P 的面积贡献同理，按源像元类别累加：
+水深源像元 s 到人口格 P 的面积贡献按源像元类别累加。**关键约束**：归到
+流域 B 的各类面积必须是三向交集，即水深像元、人口格、流域三者的公共部分，
+而不能用“流域占格比例 × 格内类别比例”的乘积代替 —— 后者丢掉了类别在格内
+的位置，会把格一侧的洪水或 NoData 错误地算到另一侧流域：
 
 ```
-A_wet(P)    = Σ_s area(s ∩ P)  ，depth(s) > 阈值 且 s 有效
-A_dry(P)    = Σ_s area(s ∩ P)  ，depth(s) ≤ 阈值 且 s 有效（含有效零）
-A_nodata(P) = Σ_s area(s ∩ P)  ，s 为 NoData
-A_oob(P)    = area(P) − 以上三者
+A_wet(B, P)    = Σ_s area(s ∩ P ∩ B)  ，depth(s) > 阈值 且 s 有效
+A_dry(B, P)    = Σ_s area(s ∩ P ∩ B)  ，depth(s) ≤ 阈值 且 s 有效（含有效零）
+A_nodata(B, P) = Σ_s area(s ∩ P ∩ B)  ，s 为 NoData
+A_oob(B, P)    = area(B ∩ P) − 以上三者
 ```
 
 ### 2.1 受淹人口
 
-人口按面积均摊到单位面积，流域 B 在格 P 上“拥有”的人口为 `w(B,P)·pop(P)`：
+人口在原人口格内按面积均匀分布，因此受淹人数按真实受淹交集占**原格**的
+面积份额计算；流域在格内“拥有”的人口则按 `area(B∩P)/area(P)` 计算：
 
 ```
-exposed_pop(B, t) = Σ_P w(B,P) · pop(P) · wet_fraction(P, t)
-wet_fraction(P,t) = A_wet(P,t) / area(P)
+exposed_pop(B, t) = Σ_P pop(P) · A_wet(B,P,t) / area(P)
+weighted_pop(B)   = Σ_P pop(P) · area(B∩P)     / area(P)
 ```
 
-NoData/OOB 不进入 `wet_fraction`，因此该估计是**保守下界**；缺测规模通过
+NoData/OOB 不进入 `A_wet`，因此该估计是**保守下界**；缺测规模通过
 `missing_fraction` 与质量标记单独披露，而不是被悄悄当作干地。
 
 ### 2.2 相邻流域重叠
@@ -75,10 +80,12 @@ NoData/OOB 不进入 `wet_fraction`，因此该估计是**保守下界**；缺�
 
 - 源水深栅格按 `window_tile_size` 分块从磁盘读取（`rasterio.windows.Window`），
   窗口只决定每次 I/O 的像元范围；
-- 每个像元的工作 CRS 四边形与相交面积由几何唯一确定，与它在哪个窗口被
-  读到无关，因此改变 tile 尺寸权重不变（测试要求差值 < 1e-6）；
+- 每个像元的 `area(s ∩ P ∩ B)` 由几何唯一确定，与它在哪个窗口被读到无关，
+  因此改变 tile 尺寸权重与类别面积均不变（测试要求差值 < 1e-6）；
 - 累加器只做加法，满足交换律/结合律，分块顺序（正序、逆序、乱序）结果
-  在声明精度 `DECLARED_PRECISION = 1e-6` 内一致。
+  在声明精度 `DECLARED_PRECISION = 1e-6` 内一致；
+- 回归样例 `test_spatial_attribution.py` 用独立的小网格几何求交核对受淹/
+  干地/缺测/OOB 面积与受淹人数，并在不同工作 CRS、不同 tile 下复算。
 
 ## 4. 边界增量处理
 

@@ -71,7 +71,7 @@ bash demo/run_demo.sh
 测试：
 
 ```bash
-.venv/bin/python -I -m pytest tests/      # 21 个测试
+.venv/bin/python -I -m pytest tests/      # 29 个测试
 ```
 
 ## 输出结构
@@ -97,8 +97,10 @@ out/
 - **面积权重**：`w(B,P) = area(B∩P) / area(P)`，面积均在等面积 EPSG:6933
   下计算。相邻流域重叠时各取自己的相交份额，同一人口格不会被两个流域
   重复全额计数。
-- **受淹人口**：`Σ_B,P w(B,P)·pop(P)·wet_frac(P)`，是缺测不补零下的
-  保守下界。
+- **受淹人口**：各类面积取三向交集 `area(水深像元 ∩ 人口格 ∩ 流域)`，
+  `exposed_pop = Σ pop(P)·A_wet(B,P)/area(P)`；缺测比例的分母是流域被
+  人口网格覆盖的面积 `area(B∩P)`。受淹区与流域是否在同一侧由几何相交
+  决定，不是两个格级比例的乘积；缺测不补零，结果仍是保守下界。
 
 ## 命令一览
 
