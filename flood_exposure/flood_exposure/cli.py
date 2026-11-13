@@ -9,6 +9,7 @@ run-incremental  边界增量处理（复用权重缓存，只重建几何变化
 query            流域明细 / 时次明细查询
 manifest         打印计算清单（追溯到参与计算的全部输入版本）
 releases         列出已发布版本
+``delineate        从 DEM + 测站表推导 D8 流向、贡献面积与测站汇水分区
 """
 from __future__ import annotations
 
@@ -185,6 +186,63 @@ def cmd_releases(args) -> int:
     return 0
 
 
+def cmd_delineate(args) -> int:
+    # 延迟导入：delineate 用到 numpy/rasterio，只有真跑时才加载
+    from .hydrology import (
+        DemError,
+        NoOutletError,
+        load_dem,
+        load_stations,
+        delineate,
+        write_all_outputs,
+    )
+
+    try:
+        grid = load_dem(args.dem)
+        stations = load_stations(args.stations, grid)
+    except (DemError, FileNotFoundError) as exc:
+        print(f"[输入错误] {exc}", file=sys.stderr)
+        return 2
+    try:
+        result, summary = delineate(grid, stations)
+    except NoOutletError as exc:
+        print(f"[无法确定排水拓扑] {exc}", file=sys.stderr)
+        return 3
+    except DemError as exc:
+        print(f"[推导失败] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        written = write_all_outputs(args.output_dir, grid, result, summary,
+                                    args.dem, args.stations)
+    except OSError as exc:
+        print(f"[写出失败] {exc}", file=sys.stderr)
+        return 1
+
+    print(json.dumps({
+        "output_dir": str(args.output_dir),
+        "dem_sha256": written["inputs"]["dem"]["sha256"],
+        "stations": {r["outlet_id"]: {
+            "row": r["row"], "col": r["col"],
+            "elevation_m": r["elevation_m"],
+            "filled_elevation_m": r["filled_elevation_m"],
+            "total_upstream_area_m2": r["total_upstream_area_m2"],
+            "exclusive_area_m2": r["exclusive_area_m2"],
+            "next_downstream_outlet": r["next_downstream_outlet"],
+        } for r in written["stations"]},
+        "outside_area_m2": written["outside_area_m2"],
+        "unassigned_area_m2": written["unassigned_area_m2"],
+        "fill_volume_m3": written["fill_volume_m3"],
+        "pit_filled_cells": written["pit_filled_cells"],
+        "rasters": [
+            "filled_dem.tif", "pit_depth_m.tif", "flow_direction.tif",
+            "contributing_area_m2.tif", "exclusive_partition.tif",
+        ],
+        "summary": "summary.json", "stations_csv": "stations.csv",
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="flood-exposure",
@@ -265,6 +323,19 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--basin-id", default=None)
     pm.add_argument("--release", default=None)
     pm.set_defaults(func=cmd_manifest)
+
+    # ---- delineate -----------------------------------------------------
+    pd = sub.add_parser(
+        "delineate",
+        help="从 DEM + 测站表推导排水拓扑与测站汇水分区 (地形推导, 非水动力模拟)",
+        description="输入单波段米制投影 GeoTIFF 高程与测站 CSV (outlet_id,row,col)，"
+                    "输出填洼高程、D8 流向、贡献面积、独占分区与测站摘要。",
+    )
+    pd.add_argument("--dem", required=True, help="单波段 GeoTIFF 高程 (米制投影, 北向上)")
+    pd.add_argument("--stations", required=True,
+                    help="测站 CSV，列 outlet_id,row,col (行列从 0 开始)")
+    pd.add_argument("--output-dir", required=True, dest="output_dir")
+    pd.set_defaults(func=cmd_delineate)
 
     # ---- releases ------------------------------------------------------
     pl = sub.add_parser("releases", help="列出完整发布版本")

@@ -23,6 +23,9 @@
 | 流域明细查询 + 计算清单 | `query.py`, CLI `query` / `manifest` |
 | 独立参考计算对照 | `reference.py`（规则点阵，独立代码路径） |
 | 远程大文件可恢复下载（真实 HTTP + 断点续传） | `fetch.py`, CLI `fetch`, 演示 `demo/fetch_demo.py` |
+| 无边界资料时从 DEM 推导汇水边界 | `hydrology.py`, CLI `delineate`, 演示 `demo/delineate_demo.py` |
+| 填洼只抬高 / 平地显式展开 / D8 最陡 + 固定等坡规则 | `hydrology.py::priority_flood` / `build_direction` |
+| 测站贡献面积与独占分区两个口径 | `hydrology.py::flow_topology` / `summarise` |
 
 ## 安装
 
@@ -140,6 +143,49 @@ downloads/
   人口网格覆盖的面积 `area(B∩P)`。受淹区与流域是否在同一侧由几何相交
   决定，不是两个格级比例的乘积；缺测不补零，结果仍是保守下界。
 
+## 无边界资料：`delineate` 从 DEM 推导汇水边界
+
+若新山区没有现成流域边界，但有**单波段米制投影 GeoTIFF 高程**和
+**测站 CSV**（`outlet_id,row,col`，行列从 0 开始、指向像元中心、不自动
+吸附），`delineate` 在本地完成整条处理链：
+
+```bash
+.venv/bin/python -I demo/make_dem_samples.py /tmp/dem_samples   # 生成手画矩阵
+
+.venv/bin/flood-exposure delineate \
+  --dem /tmp/dem_samples/branching_and_serial/dem.tif \
+  --stations /tmp/dem_samples/branching_and_serial/stations.csv \
+  --output-dir /tmp/delineate_out
+```
+
+输出 `filled_dem.tif`、`pit_depth_m.tif`、`flow_direction.tif`、
+`contributing_area_m2.tif`、`exclusive_partition.tif`、`summary.json`、
+`stations.csv`。
+
+口径与规则（完整推导见 `docs/METHODOLOGY.md` 第 9–13 节）：
+
+- **有效格** = 高程有限且未被 NoData 掩膜；无效格是不可穿越屏障，不是泄水口；
+- **填洼** 优先漫水只从最外圈有效格出发，只抬高不降低；某个有效连通块
+  完全不接触外圈时直接报错（退出码 3），不穿 NoData、不凭空选出口；
+- **D8** 有更低邻格时按 `(z_c-z_n)/dist` 取最陡（`dist` 用横纵分辨率，
+  长宽不同会改变最陡方向）；等坡度按固定顺序 `NW,N,NE,E,SE,S,SW,W` 取第一个；
+  填平平台用“同高程反向 BFS 跳数”显式展开，不叠加微斜坡、不按邻格编号乱选；
+- **编码** `0..7` 邻域、`8` 流出图（OUTSIDE）、`255` 无效（NoData），
+  `summary.json` 附逐码说明，可沿它走完整条路径；
+- **贡献面积** 含像元自身，沿拓扑序一次累加；**独占分区**是“下游首先经过
+  该测站”的格，串联时上游站的面积不计入下游站独占分区，但下游站贡献面积
+  仍包含全部真实上游面积。`Σ独占 + 未归属 = 有效总面积`；
+- 测站索引按格坐标排序，**CSV 行序翻转/打乱不改变任何结果**；
+- 产出是**地形推导的汇水边界**，不代表洪水水动力模拟。
+
+演示脚本会打印方向箭头地图、填洼量手算、长宽不同的方向变化，并独立逐格
+核对（有效格全到外界、无环、贡献面积=枚举上游、分区不交叠且完备），
+再对错误输入逐一确认失败原因：
+
+```bash
+.venv/bin/python -I demo/delineate_demo.py
+```
+
 ## 命令一览
 
 | 子命令 | 作用 |
@@ -151,3 +197,4 @@ downloads/
 | `query` | 按流域或预报时次查询已发布明细 |
 | `manifest` | 打印计算清单与输入版本追溯 |
 | `releases` | 列出完整发布版本 |
+| `delineate` | 从 DEM + 测站表推导 D8 流向、贡献面积与测站汇水分区 |
