@@ -10,6 +10,7 @@ query            流域明细 / 时次明细查询
 manifest         打印计算清单（追溯到参与计算的全部输入版本）
 releases         列出已发布版本
 ``delineate        从 DEM + 测站表推导 D8 流向、贡献面积与测站汇水分区
+rainfall         本地整理雨量站累计翻斗读数：逐段雨量 + 降雨事件 + 质量摘要
 """
 from __future__ import annotations
 
@@ -18,6 +19,8 @@ import json
 import sys
 from pathlib import Path
 
+# 顶层只保留轻量、纯标准库依赖；各子命令的重依赖（numpy/rasterio/geopandas）
+# 全部延迟到对应 cmd_* 内部导入，保证 `rainfall` 等本地命令在最小环境也可用。
 from .config import Config
 from .hashing import sha256_file
 from .manifest import (
@@ -26,16 +29,6 @@ from .manifest import (
     InputInventory,
     PopulationEntry,
 )
-from .publishing import PublishGateError
-from .query import (
-    available_releases,
-    load_exposure_rows,
-    load_run_manifest,
-    provenance,
-    query_basin,
-    query_forecast,
-)
-from .runner import run_pipeline
 
 
 def _build_inventory(args) -> InputInventory:
@@ -133,6 +126,9 @@ def _load_config(args) -> Config:
 
 
 def cmd_run(args) -> int:
+    from .publishing import PublishGateError
+    from .runner import run_pipeline
+
     inv = InputInventory.from_file(args.inventory)
     cfg = _load_config(args)
     try:
@@ -154,6 +150,8 @@ def cmd_run(args) -> int:
 
 
 def cmd_query(args) -> int:
+    from .query import query_basin, query_forecast
+
     try:
         if args.forecast_time:
             rows = query_forecast(args.output_root, args.forecast_time, args.release)
@@ -168,6 +166,8 @@ def cmd_query(args) -> int:
 
 
 def cmd_manifest(args) -> int:
+    from .query import load_run_manifest, provenance
+
     try:
         if args.basin_id:
             data = provenance(args.output_root, args.basin_id, args.release)
@@ -181,8 +181,38 @@ def cmd_manifest(args) -> int:
 
 
 def cmd_releases(args) -> int:
+    from .query import available_releases
+
     for name in available_releases(args.output_root):
         print(name)
+    return 0
+
+
+def cmd_rainfall(args) -> int:
+    # 纯标准库本地处理，延迟导入以保持子命令隔离（不触碰栅格/DEM 链路）
+    from .rain import RainConfigError, RainInputError, RainOutputError
+    from .rain import process_rainfall
+
+    try:
+        summary = process_rainfall(
+            args.readings, args.config, args.output_dir)
+    except RainConfigError as exc:
+        print(f"[配置错误] {exc}", file=sys.stderr)
+        return 2
+    except RainInputError as exc:
+        print(f"[输入冲突] {exc}", file=sys.stderr)
+        return 3
+    except RainOutputError as exc:
+        print(f"[写出失败] {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps({
+        "output_dir": args.output_dir,
+        "segments_csv": "rainfall_segments.csv",
+        "events_csv": "rainfall_events.csv",
+        "summary_json": "rainfall_summary.json",
+        "counts": summary["counts"],
+        "quality_flag_counts": summary["quality_flag_counts"],
+    }, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -341,6 +371,27 @@ def build_parser() -> argparse.ArgumentParser:
     pl = sub.add_parser("releases", help="列出完整发布版本")
     pl.add_argument("--output-root", required=True)
     pl.set_defaults(func=cmd_releases)
+
+    # ---- rainfall ------------------------------------------------------
+    prn = sub.add_parser(
+        "rainfall",
+        help="本地整理雨量站累计翻斗读数（逐段雨量、降雨事件、质量摘要）",
+        description="读取读数 CSV 与设备配置 JSON，输出逐段降雨量 CSV、"
+                    "降雨事件 CSV 和带输入 SHA256 的 JSON 处理摘要。"
+                    "纯本地处理，不接入网络，也不影响洪水栅格/DEM 计算。"
+                    "累计计数只确定观测区间上的雨量，不能据此声称雨在区间内"
+                    "的精确落点时刻。",
+    )
+    prn.add_argument("--readings", required=True,
+                     help="读数 CSV，列 device_id,observed_at,cumulative_count；"
+                          "observed_at 必须带时区偏移（如 2026-06-01T08:00:00+08:00）")
+    prn.add_argument("--config", required=True,
+                     help="设备配置 JSON：每台设备给 tip_mm、max_interval_seconds、"
+                          "dry_separation_seconds，可选 counter_modulus 与 maintenance")
+    prn.add_argument("--output-dir", required=True, dest="output_dir",
+                     help="输出目录；三个结果文件先写临时文件并回读校验，"
+                          "再原子替换已有目标，失败时不留下半成品")
+    prn.set_defaults(func=cmd_rainfall)
     return p
 
 

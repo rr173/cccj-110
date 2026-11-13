@@ -26,6 +26,9 @@
 | 无边界资料时从 DEM 推导汇水边界 | `hydrology.py`, CLI `delineate`, 演示 `demo/delineate_demo.py` |
 | 填洼只抬高 / 平地显式展开 / D8 最陡 + 固定等坡规则 | `hydrology.py::priority_flood` / `build_direction` |
 | 测站贡献面积与独占分区两个口径 | `hydrology.py::flow_topology` / `summarise` |
+| 雨量累计读数 → 逐段雨量/降雨事件（纯本地、标准库） | `rain.py`, CLI `rainfall`, 演示 `demo/make_rain_samples.py` |
+| 回绕/重置/超长空档/检修窗口显式质量标记，无效段截断事件 | `rain.py::_classify_interval` / `build_events` |
+| 雨量结果原子替换，输入冲突不留半成品 | `rain.py::process_rainfall` |
 
 ## 安装
 
@@ -186,6 +189,60 @@ downloads/
 .venv/bin/python -I demo/delineate_demo.py
 ```
 
+## 本地雨量过程整理：`rainfall`
+
+把雨量站定时上报的**累计翻斗计数器读数**整理为可追查质量问题的逐段
+降雨量与降雨事件。纯本地、纯标准库实现，不接入网络，也不影响洪水栅格 /
+DEM 计算链。
+
+```bash
+# 生成刻意乱序的合成读数/配置并运行独立手算断言（无需第三方依赖）
+python3 -I demo/make_rain_samples.py sample_rain
+
+# 正式整理：读数 CSV + 设备配置 JSON -> 三个结果文件
+flood-exposure rainfall \
+  --readings sample_rain/readings.csv \
+  --config sample_rain/devices.json \
+  --output-dir sample_rain/rainfall_output
+```
+
+读数 CSV 固定三列 `device_id,observed_at,cumulative_count`，时间必须带
+时区偏移（如 `2026-06-01T08:00:00+08:00`），内部统一换算 UTC 再排序。
+设备配置示例：
+
+```json
+{
+  "devices": {
+    "RG-WRAP": {
+      "tip_mm": 0.2,
+      "max_interval_seconds": 7200,
+      "dry_separation_seconds": 1800,
+      "counter_modulus": 100,
+      "maintenance": [
+        {"start": "2026-06-01T01:00:00+00:00",
+         "end": "2026-06-01T02:00:00+00:00"}
+      ]
+    }
+  }
+}
+```
+
+口径要点（完整说明见 `docs/METHODOLOGY.md` 第 14–15 节）：
+
+- **累计计数只确定区间雨量**：相邻有效读数之差 × 每斗毫米数，归属于整个
+  `[前一观测时刻, 后一观测时刻)` 区间，不能据此声称雨在区间内的精确落点；
+- 同刻同值记录合并并保留全部原始行号；同刻不同值、缺时区、未知设备、
+  负读数、非法配置一律明确拒绝，不猜测不静默忽略；
+- 读数下降只有在配置模数且严格跨过 `modulus-1 → 0` 边界时才按回绕计算，
+  否则视为设备重置，段无效并从新读数重建基准；
+- 超过最大间隔、与检修半开区间相交的段禁止跨段相减；有效零雨段
+  （`ZERO_RAIN`）与无效段严格区分；
+- 无效段与超长空档强制截断事件；干旱时长**严格大于**配置值才拆场；
+  事件标注是否被数据边界截断；
+- 三个输出先写临时文件、回读校验再原子替换，失败时回滚，旧结果保持可用；
+  摘要记录两份输入的 SHA256、完整配置、读数/合并/拒绝数量与各质量标记
+  数量。
+
 ## 命令一览
 
 | 子命令 | 作用 |
@@ -198,3 +255,4 @@ downloads/
 | `manifest` | 打印计算清单与输入版本追溯 |
 | `releases` | 列出完整发布版本 |
 | `delineate` | 从 DEM + 测站表推导 D8 流向、贡献面积与测站汇水分区 |
+| `rainfall` | 本地整理累计翻斗读数：逐段雨量 CSV、降雨事件 CSV、带 SHA256 的摘要 JSON |
