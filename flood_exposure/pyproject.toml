@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flood-exposure"
-version = "1.0.1"
-description = "可追溯的流域洪水暴露度分析：等面积面积权重、DEM 汇水推导、暂存发布"
+version = "1.1.0"
+description = "可追溯的流域洪水暴露度分析：等面积面积权重、DEM 汇水推导、雨量整理、撤离可达性、暂存发布"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",

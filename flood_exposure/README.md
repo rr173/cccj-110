@@ -29,6 +29,9 @@
 | 雨量累计读数 → 逐段雨量/降雨事件（纯本地、标准库） | `rain.py`, CLI `rainfall`, 演示 `demo/make_rain_samples.py` |
 | 回绕/重置/超长空档/检修窗口显式质量标记，无效段截断事件 | `rain.py::_classify_interval` / `build_events` |
 | 雨量结果原子替换，输入冲突不留半成品 | `rain.py::process_rainfall` |
+| 撤离可达性：赶在道路被淹前到达开放避险点的可执行行程 | `evacuation.py`, CLI `evacuation-access`, 演示 `demo/make_evac_samples.py` |
+| 状态=(路口,分钟)的精确搜索：最早抵达→最少等待→道路编号字典序 | `evacuation.py::search` |
+| 未知路况绝不当干路；车程整段区间检查；重叠冲突整体拒绝 | `evacuation.py::load_conditions` / `road_status` |
 
 ## 安装
 
@@ -243,6 +246,57 @@ flood-exposure rainfall \
   摘要记录两份输入的 SHA256、完整配置、读数/合并/拒绝数量与各质量标记
   数量。
 
+## 应急撤离可达性：`evacuation-access`
+
+回答应急值班的问题：**从某路口出发，车能否赶在道路被淹以前到达仍开放
+的避险点？** 只看出发那一刻的路况不够——车开到一半道路可能已经封闭；
+提前到达的路口也不一定允许安全等待。命令读取已经整理好的路网与积水
+片段，按“地点 × 分钟”的状态空间计算可实际执行的撤离行程。纯本地、
+纯标准库实现，不影响洪水栅格 / DEM / 雨量计算链。
+
+```bash
+# 生成覆盖全部规定场景的小路网样例并运行独立断言（无需第三方依赖）
+python3 -I demo/make_evac_samples.py sample_evac
+
+# 正式计算：路网 JSON + 积水 CSV + 查询 JSON -> 逐请求结论的报告
+flood-exposure evacuation-access \
+  --network sample_evac/network.json \
+  --conditions sample_evac/conditions.csv \
+  --queries sample_evac/queries.json \
+  --output sample_evac/report.json
+```
+
+输入（全部是相对同一参考时刻的整数分钟，完整口径见
+`docs/METHODOLOGY.md` 第 16–20 节）：
+
+- **路网 JSON**：`analysis_window`（有限分析范围）、`intersections`
+  （`node_id`、`can_wait`、`flooded_intervals`）、`roads`（`road_id`、
+  `from_node`/`to_node`、正整数 `travel_minutes`、可通行最大积水深度
+  `max_depth_m`）、`shelters`（挂在路口上的若干开放窗口）；
+- **积水 CSV**：`road_id,begin,end,depth_m`，左闭右开；`depth_m` 为
+  非负数或空值（未知）。空档与空值都是未知，**绝不当成干路**；重叠
+  片段只有深度含义相同才可合并，冲突即整体拒绝；
+- **查询 JSON**：`{"requests": [{request_id, origin, depart_minute,
+  deadline_minute}, ...]}`，逐请求独立返回。
+
+口径要点：
+
+- 一段车程 `[enter, exit)` 必须在**整个**区间上有已知且合格的路况；
+  深度等于上限仍可通过，超过不可通过；车程恰在封闭窗口开始的那一分钟
+  结束时道路检查不含抵达端点，但目的路口仍检查抵达当时是否受淹；
+- 等待一分钟要求路口允许等待且这一整分钟安全；不能在道路中间停车；
+  只沿道路给定方向行驶；避险点窗口左闭右开，抵达关闭时刻不算赶上；
+  起点在出发时已受淹直接判 `invalid_request`；
+- 优化顺序：最早抵达任一开放避险点 → 累计等待分钟最少 → 道路编号
+  序列字典序；搜索状态是 (路口, 分钟)，禁止等待的路口可以绕行后更晚
+  抵达再接上开放道路；道路耗时为正且截止分钟有限，搜索必然终止；
+- 结果分 `reachable`（选中避险点、抵达分钟、逐条道路进入/离开分钟、
+  等待位置与时长）、`unreachable`（搜索范围 + 超深/未知/禁止等待等
+  阻塞原因分类计数）、`invalid_request`（具体原因）；同批一个请求
+  无效不丢失其他请求；路网/路况自身非法则整体拒绝（退出码 2/3/4）；
+- 报告保留三份输入的 SHA256 与分析参数，便于回头核对行程依据。
+  **结论只在已知路况与所给行驶时间假设下成立。**
+
 ## 命令一览
 
 | 子命令 | 作用 |
@@ -256,3 +310,4 @@ flood-exposure rainfall \
 | `releases` | 列出完整发布版本 |
 | `delineate` | 从 DEM + 测站表推导 D8 流向、贡献面积与测站汇水分区 |
 | `rainfall` | 本地整理累计翻斗读数：逐段雨量 CSV、降雨事件 CSV、带 SHA256 的摘要 JSON |
+| `evacuation-access` | 撤离可达性：按（路口,分钟）搜索赶在道路被淹前到达开放避险点的可执行行程 |

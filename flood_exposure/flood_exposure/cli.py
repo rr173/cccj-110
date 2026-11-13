@@ -11,6 +11,8 @@ manifest         打印计算清单（追溯到参与计算的全部输入版本
 releases         列出已发布版本
 ``delineate        从 DEM + 测站表推导 D8 流向、贡献面积与测站汇水分区
 rainfall         本地整理雨量站累计翻斗读数：逐段雨量 + 降雨事件 + 质量摘要
+evacuation-access  撤离可达性：按“地点×分钟”计算赶在道路被淹前到达开放
+                 避险点的可执行行程（纯本地、标准库）
 """
 from __future__ import annotations
 
@@ -216,6 +218,38 @@ def cmd_rainfall(args) -> int:
     return 0
 
 
+def cmd_evacuation_access(args) -> int:
+    # 纯标准库本地计算，延迟导入以保持子命令隔离
+    from .evacuation import (
+        EvacuationConditionsError,
+        EvacuationNetworkError,
+        EvacuationOutputError,
+        EvacuationQueryError,
+        run_evacuation,
+        write_report,
+    )
+
+    try:
+        report = run_evacuation(args.network, args.conditions, args.queries)
+    except EvacuationNetworkError as exc:
+        print(f"[路网错误] {exc}", file=sys.stderr)
+        return 2
+    except EvacuationConditionsError as exc:
+        print(f"[积水路况错误] {exc}", file=sys.stderr)
+        return 3
+    except EvacuationQueryError as exc:
+        print(f"[查询文件错误] {exc}", file=sys.stderr)
+        return 4
+    if args.output:
+        try:
+            write_report(report, args.output)
+        except EvacuationOutputError as exc:
+            print(f"[写出失败] {exc}", file=sys.stderr)
+            return 1
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_delineate(args) -> int:
     # 延迟导入：delineate 用到 numpy/rasterio，只有真跑时才加载
     from .hydrology import (
@@ -392,6 +426,33 @@ def build_parser() -> argparse.ArgumentParser:
                      help="输出目录；三个结果文件先写临时文件并回读校验，"
                           "再原子替换已有目标，失败时不留下半成品")
     prn.set_defaults(func=cmd_rainfall)
+
+    # ---- evacuation-access ----------------------------------------------
+    pev = sub.add_parser(
+        "evacuation-access",
+        help="撤离可达性：赶在道路被淹前到达开放避险点的可执行行程",
+        description="读取路网 JSON（路口/有向道路/避险点开放窗口）、积水 "
+                    "CSV（road_id,begin,end,depth_m；空值=未知）与查询 JSON "
+                    "（request_id/起点/出发分钟/截止分钟），按“地点×分钟”状态"
+                    "空间计算可实际执行的撤离行程：车程整段区间都必须有已知且"
+                    "合格的路况，未知不当干路。逐请求返回 "
+                    "reachable/unreachable/invalid_request；路网或路况本身"
+                    "非法则整体拒绝。结果只在已知路况与所给行驶时间假设下成立。",
+    )
+    pev.add_argument("--network", required=True,
+                     help="路网 JSON：analysis_window、intersections（含 "
+                          "can_wait 与受淹区间）、roads（正整数行驶分钟与可通行"
+                          "最大积水深度）、shelters（开放窗口）")
+    pev.add_argument("--conditions", required=True,
+                     help="积水 CSV：road_id,begin,end,depth_m；左闭右开，"
+                          "空值=未知；重叠冲突即整体拒绝")
+    pev.add_argument("--queries", required=True,
+                     help="查询 JSON：{\"requests\": [{request_id, origin, "
+                          "depart_minute, deadline_minute}, ...]}")
+    pev.add_argument("--output", default=None,
+                     help="可选：报告 JSON 写出路径（临时文件 + 原子替换）；"
+                          "无论是否指定，报告都会打印到标准输出")
+    pev.set_defaults(func=cmd_evacuation_access)
     return p
 
 
